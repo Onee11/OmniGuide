@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.streamlit/secrets.toml
+.directory
+test-screen.png
+annotated*.png
+omniguide_capture_test.png

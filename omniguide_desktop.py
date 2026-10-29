@@ -1,0 +1,515 @@
+from __future__ import annotations
+
+import base64
+import io
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from openai import OpenAI
+from PIL import Image, ImageDraw
+from PySide6.QtCore import QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QProgressBar,
+    QSizePolicy,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+APP_DIR = Path(__file__).resolve().parent
+load_dotenv(APP_DIR / ".env")
+MODEL_NAME = "meta-models/muse-spark-open-1026"
+BASE_URL = "https://inference.baseten.co/v1"
+
+
+STYLESHEET = """
+QWidget {
+    background: #0b1020;
+    color: #edf2ff;
+    font-family: Inter, 'Noto Sans', sans-serif;
+    font-size: 13px;
+}
+QFrame#Sidebar {
+    background: #10182a;
+    border: 1px solid #202d45;
+    border-radius: 16px;
+}
+QFrame#PreviewFrame {
+    background: #0e1627;
+    border: 1px solid #202d45;
+    border-radius: 16px;
+}
+QLabel#Brand {
+    color: #72e0ff;
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: 2px;
+}
+QLabel#Muted { color: #9aabc6; }
+QLabel#Section { color: #d9e7ff; font-size: 14px; font-weight: 700; }
+QLineEdit, QTextEdit {
+    background: #0b1221;
+    border: 1px solid #2a3b59;
+    border-radius: 9px;
+    padding: 10px;
+    selection-background-color: #167bb4;
+}
+QLineEdit:focus, QTextEdit:focus { border-color: #52c7f4; }
+QPushButton {
+    background: #1a2941;
+    border: 1px solid #324967;
+    border-radius: 9px;
+    padding: 10px 12px;
+    font-weight: 600;
+}
+QPushButton:hover { background: #243958; border-color: #52c7f4; }
+QPushButton:disabled { color: #64748b; background: #182236; border-color: #26344a; }
+QPushButton#Primary {
+    background: #087fa7;
+    border: 1px solid #29b9e7;
+    color: white;
+    padding: 12px;
+}
+QPushButton#Primary:hover { background: #0997c2; }
+QLabel#Status { color: #72e0ff; font-weight: 600; }
+QProgressBar {
+    background: #1a2941;
+    border: 0;
+    border-radius: 3px;
+    max-height: 5px;
+    min-height: 5px;
+}
+QProgressBar::chunk { background: #52c7f4; border-radius: 3px; }
+QLabel#ImagePreview {
+    background: #080d18;
+    border: 1px dashed #2b3a52;
+    border-radius: 10px;
+    color: #8293ad;
+}
+"""
+
+
+def parse_model_json(content: str) -> dict[str, Any]:
+    """Parse JSON even if the model unexpectedly wraps it in prose/fences."""
+    text = content.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            raise ValueError("The model did not return a JSON object.")
+        parsed = json.loads(match.group(0))
+
+    if not isinstance(parsed, dict):
+        raise ValueError("The model response was not a JSON object.")
+
+    bbox = parsed.get("bbox_1000")
+    if bbox is None and isinstance(parsed.get("bbox"), list):
+        bbox_value = parsed["bbox"]
+        if len(bbox_value) == 4 and all(isinstance(v, (int, float)) for v in bbox_value):
+            bbox = bbox_value
+        elif bbox_value and isinstance(bbox_value[0], dict):
+            item = bbox_value[0]
+            if all(k in item for k in ("x_min", "y_min", "x_max", "y_max")):
+                bbox = [item[k] for k in ("x_min", "y_min", "x_max", "y_max")]
+
+    if parsed.get("found") is True and bbox is not None:
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            raise ValueError("The model returned an invalid bounding box.")
+        if not all(isinstance(v, (int, float)) for v in bbox):
+            raise ValueError("Bounding-box coordinates must be numbers.")
+        # Clamp to the normalized image bounds and validate box ordering.
+        bbox = [max(0, min(1000, int(round(v)))) for v in bbox]
+        x1, y1, x2, y2 = bbox
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError("The model returned an empty or reversed bounding box.")
+        parsed["bbox_1000"] = bbox
+    else:
+        parsed["found"] = False
+        parsed["bbox_1000"] = None
+
+    return parsed
+
+
+class VisionWorker(QThread):
+    succeeded = Signal(object, object, str)
+    failed = Signal(str)
+
+    def __init__(self, image_path: str, target: str):
+        super().__init__()
+        self.image_path = image_path
+        self.target = target
+
+    def run(self) -> None:
+        try:
+            api_key = os.getenv("BASETEN_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "BASETEN_API_KEY is missing. Check the .env file in the project folder."
+                )
+
+            image_path = Path(self.image_path)
+            mime_type = {".png": "image/png", ".webp": "image/webp"}.get(image_path.suffix.lower(), "image/jpeg")
+            raw = image_path.read_bytes()
+            encoded = base64.b64encode(raw).decode("ascii")
+            image_url = f"data:{mime_type};base64,{encoded}"
+
+            prompt = f"""
+You are the visual grounding component of OmniGuide, a screen-aware AI companion.
+Locate this exact visible UI element in the screenshot: {self.target!r}
+
+Return only one JSON object with these fields:
+- target: the requested target as a string
+- found: true or false
+- bbox_1000: [x_min, y_min, x_max, y_max], or null
+- reason: concise visual evidence for the result
+
+Coordinates are integers on a normalized 0–1000 grid relative to the full image.
+The origin is the top-left; the bottom-right is (1000, 1000).
+Draw a tight box around the requested element only, not its parent menu or nearby controls.
+Do not assume the target's position. Do not guess. If it is not clearly visible, use found=false and bbox_1000=null.
+"""
+
+            client = OpenAI(
+                api_key=api_key,
+                base_url=BASE_URL,
+                timeout=120.0,
+                max_retries=0,
+            )
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    }
+                ],
+            )
+
+            content = response.choices[0].message.content or ""
+            parsed = parse_model_json(content)
+            usage = response.usage
+            usage_text = ""
+            if usage:
+                usage_text = (
+                    f"Tokens: {usage.prompt_tokens:,} input · "
+                    f"{usage.completion_tokens:,} output · {usage.total_tokens:,} total"
+                )
+            self.succeeded.emit(parsed, usage_text, image_path.name)
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class ImagePreview(QLabel):
+    def __init__(self) -> None:
+        super().__init__("Open a screenshot to begin")
+        self.setObjectName("ImagePreview")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(520, 380)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._source_pixmap: QPixmap | None = None
+
+    def set_source(self, pixmap: QPixmap) -> None:
+        self._source_pixmap = pixmap
+        self._refresh_scaled()
+
+    def _refresh_scaled(self) -> None:
+        if self._source_pixmap and not self._source_pixmap.isNull():
+            self.setPixmap(
+                self._source_pixmap.scaled(
+                    self.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API name)
+        super().resizeEvent(event)
+        self._refresh_scaled()
+
+
+class OmniGuideWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("OmniGuide — Desktop Companion")
+        self.resize(1220, 800)
+        self.setMinimumSize(960, 640)
+
+        self.image_path: str | None = None
+        self.annotated_bytes: bytes | None = None
+        self.worker: VisionWorker | None = None
+        self.loading_frames = ["·", "··", "···", "····"]
+        self.loading_index = 0
+        self.loading_timer = QTimer(self)
+        self.loading_timer.setInterval(260)
+        self.loading_timer.timeout.connect(self._animate_loading)
+
+        root = QWidget()
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(18, 18, 18, 18)
+        root_layout.setSpacing(16)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(330)
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(20, 22, 20, 20)
+        side.setSpacing(12)
+
+        brand = QLabel("OMNIGUIDE")
+        brand.setObjectName("Brand")
+        side.addWidget(brand)
+
+        tagline = QLabel("A screen-aware AI companion")
+        tagline.setObjectName("Muted")
+        side.addWidget(tagline)
+
+        intro = QLabel(
+            "Ask about what's on your screen. OmniGuide will find the target and show a visual highlight."
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("Muted")
+        side.addWidget(intro)
+        side.addSpacing(10)
+
+        screenshot_heading = QLabel("SCREENSHOT")
+        screenshot_heading.setObjectName("Section")
+        side.addWidget(screenshot_heading)
+
+        self.open_button = QPushButton("Open screenshot…")
+        self.open_button.clicked.connect(self.open_screenshot)
+        side.addWidget(self.open_button)
+
+        self.file_label = QLabel("No screenshot selected")
+        self.file_label.setWordWrap(True)
+        self.file_label.setObjectName("Muted")
+        side.addWidget(self.file_label)
+        side.addSpacing(6)
+
+        target_heading = QLabel("WHAT SHOULD I FIND?")
+        target_heading.setObjectName("Section")
+        side.addWidget(target_heading)
+
+        self.target_input = QLineEdit("Save menu item in the open File dropdown")
+        self.target_input.setPlaceholderText("e.g. the render button")
+        self.target_input.returnPressed.connect(self.analyze)
+        side.addWidget(self.target_input)
+
+        self.analyze_button = QPushButton("Analyze screen  →")
+        self.analyze_button.setObjectName("Primary")
+        self.analyze_button.clicked.connect(self.analyze)
+        side.addWidget(self.analyze_button)
+
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 0)
+        self.progress.hide()
+        side.addWidget(self.progress)
+
+        self.status_label = QLabel("Ready when you are.")
+        self.status_label.setObjectName("Status")
+        self.status_label.setWordWrap(True)
+        side.addWidget(self.status_label)
+
+        result_heading = QLabel("RESULT")
+        result_heading.setObjectName("Section")
+        side.addWidget(result_heading)
+
+        self.result_text = QTextEdit()
+        self.result_text.setReadOnly(True)
+        self.result_text.setPlaceholderText("The model's explanation and coordinates will appear here.")
+        self.result_text.setMinimumHeight(150)
+        side.addWidget(self.result_text, 1)
+
+        self.save_button = QPushButton("Save annotated screenshot…")
+        self.save_button.setEnabled(False)
+        self.save_button.clicked.connect(self.save_annotated)
+        side.addWidget(self.save_button)
+
+        footer = QLabel("Prototype · Muse Spark Open via Baseten")
+        footer.setObjectName("Muted")
+        side.addWidget(footer)
+
+        preview_frame = QFrame()
+        preview_frame.setObjectName("PreviewFrame")
+        preview_layout = QVBoxLayout(preview_frame)
+        preview_layout.setContentsMargins(16, 16, 16, 16)
+        preview_layout.setSpacing(10)
+
+        preview_header = QHBoxLayout()
+        preview_title = QLabel("VISUAL CONTEXT")
+        preview_title.setObjectName("Section")
+        preview_header.addWidget(preview_title)
+        preview_header.addStretch(1)
+        self.dimensions_label = QLabel("Original image coordinates preserved")
+        self.dimensions_label.setObjectName("Muted")
+        preview_header.addWidget(self.dimensions_label)
+        preview_layout.addLayout(preview_header)
+
+        self.preview = ImagePreview()
+        preview_layout.addWidget(self.preview, 1)
+
+        hint = QLabel(
+            "This milestone uses a selected screenshot. Live desktop capture and a floating overlay come next."
+        )
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        preview_layout.addWidget(hint)
+
+        root_layout.addWidget(sidebar)
+        root_layout.addWidget(preview_frame, 1)
+        self.setCentralWidget(root)
+        self.setStyleSheet(STYLESHEET)
+
+    def open_screenshot(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open desktop screenshot",
+            str(Path.home()),
+            "Images (*.png *.jpg *.jpeg *.webp)",
+        )
+        if not path:
+            return
+        pixmap = QPixmap(path)
+        if pixmap.isNull():
+            QMessageBox.warning(self, "Could not open image", "Choose a valid PNG, JPEG, or WebP image.")
+            return
+        self.image_path = path
+        self.annotated_bytes = None
+        self.preview.set_source(pixmap)
+        self.file_label.setText(Path(path).name)
+        self.dimensions_label.setText(f"{pixmap.width()} × {pixmap.height()} px · source resolution")
+        self.result_text.clear()
+        self.save_button.setEnabled(False)
+        self.status_label.setText("Screenshot loaded. Choose a target to find.")
+
+    def analyze(self) -> None:
+        if self.worker and self.worker.isRunning():
+            return
+        if not self.image_path:
+            QMessageBox.information(self, "Choose a screenshot", "Open a screenshot before asking OmniGuide to analyze it.")
+            return
+        target = self.target_input.text().strip()
+        if not target:
+            QMessageBox.information(self, "Enter a target", "Describe the element you want OmniGuide to locate.")
+            return
+
+        self.analyze_button.setEnabled(False)
+        self.open_button.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.progress.show()
+        self.loading_index = 0
+        self.status_label.setText("Muse Spark is examining your screenshot ·")
+        self.result_text.setPlainText("Looking for the requested interface element…")
+        self.loading_timer.start()
+
+        self.worker = VisionWorker(self.image_path, target)
+        self.worker.succeeded.connect(self.on_success)
+        self.worker.failed.connect(self.on_failure)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def _animate_loading(self) -> None:
+        self.loading_index = (self.loading_index + 1) % len(self.loading_frames)
+        dots = self.loading_frames[self.loading_index]
+        self.status_label.setText(f"Muse Spark is examining your screenshot {dots}")
+
+    def on_success(self, data: dict[str, Any], usage_text: str, image_name: str) -> None:
+        details = [
+            f"Target: {data.get('target', 'requested element')}",
+            f"Found: {'Yes' if data.get('found') else 'No'}",
+            f"Reason: {data.get('reason', 'No explanation returned.')}",
+        ]
+        self.annotated_bytes = None
+
+        if data.get("found") and data.get("bbox_1000"):
+            try:
+                with Image.open(self.image_path) as src:
+                    image = src.convert("RGB")
+                    width, height = image.size
+                    x1n, y1n, x2n, y2n = data["bbox_1000"]
+                    x1 = round(x1n * width / 1000)
+                    y1 = round(y1n * height / 1000)
+                    x2 = round(x2n * width / 1000)
+                    y2 = round(y2n * height / 1000)
+                    stroke = max(3, min(width, height) // 250)
+                    draw = ImageDraw.Draw(image)
+                    draw.rectangle((x1, y1, x2, y2), outline=(255, 62, 83), width=stroke)
+                    label = f"{data.get('target', 'Target')}  ({x1}, {y1}, {x2}, {y2})"
+                    # Keep the label within the image bounds.
+                    text_y = max(0, y1 - 24)
+                    draw.rectangle((x1, text_y, min(width - 1, x1 + 8 * len(label) + 8), min(height - 1, text_y + 22)), fill=(255, 62, 83))
+                    draw.text((x1 + 4, text_y + 4), label, fill=(255, 255, 255))
+                    buffer = io.BytesIO()
+                    image.save(buffer, format="PNG")
+                    self.annotated_bytes = buffer.getvalue()
+                    annotated_pixmap = QPixmap()
+                    if not annotated_pixmap.loadFromData(self.annotated_bytes, "PNG"):
+                        raise ValueError("Could not load the annotated image into the preview.")
+                    self.preview.set_source(annotated_pixmap)
+                    details.append(f"Normalized box: {data['bbox_1000']}")
+                    details.append(f"Pixel box: [{x1}, {y1}, {x2}, {y2}]")
+            except Exception as exc:
+                details.append(f"Could not render highlight: {exc}")
+
+        if usage_text:
+            details.extend(["", usage_text])
+        self.result_text.setPlainText("\n".join(details))
+        self.status_label.setText("Target located." if data.get("found") else "Target not confidently located.")
+        self.save_button.setEnabled(self.annotated_bytes is not None)
+
+    def on_failure(self, message: str) -> None:
+        self.result_text.setPlainText(message)
+        self.status_label.setText("The request failed. Check the message above.")
+
+    def on_worker_finished(self) -> None:
+        self.loading_timer.stop()
+        self.progress.hide()
+        self.analyze_button.setEnabled(True)
+        self.open_button.setEnabled(True)
+        self.worker = None
+
+    def save_annotated(self) -> None:
+        if not self.annotated_bytes:
+            return
+        default_name = f"annotated_{Path(self.image_path or 'screenshot.png').stem}.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save annotated screenshot", str(Path(self.image_path or APP_DIR).parent / default_name), "PNG image (*.png)"
+        )
+        if path:
+            if not path.lower().endswith(".png"):
+                path += ".png"
+            Path(path).write_bytes(self.annotated_bytes)
+            self.status_label.setText(f"Saved annotation: {Path(path).name}")
+
+
+def main() -> None:
+    app = QApplication(sys.argv)
+    app.setApplicationName("OmniGuide")
+    window = OmniGuideWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
